@@ -2,7 +2,8 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { createClient } from "@supabase/supabase-js";
 import { verifyProof, SemaphoreProof } from "@semaphore-protocol/proof";
 import crypto from "crypto";
-import { buildGroup, NS_DOMAIN, SEMAPHORE_SCOPE } from "../../lib/semaphore-group";
+import { getGroupRoot, NS_DOMAIN } from "../../lib/semaphore-group";
+import { isValidScope } from "../../lib/ns-client";
 
 const supabaseUrl = process.env.SUPABASE_URL as string;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY as string;
@@ -25,16 +26,31 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(400).json({ ok: false, error: "missing_text_or_proof" });
     }
 
-    // Build current group root from DKIM-registered members
-    const { root } = await buildGroup();
-
-    if (proof.scope !== SEMAPHORE_SCOPE) {
-      return res.status(400).json({ ok: false, error: "invalid_scope" });
+    // Validate scope is current and properly formatted
+    const currentMinute = Math.floor(Date.now() / 1000 / 60);
+    
+    // Use originalScope if available, otherwise fall back to proof.scope
+    const scopeToValidate = (proof as { originalScope?: string }).originalScope || proof.scope;
+    const scopeValid = isValidScope(scopeToValidate);
+    
+    if (!scopeValid) {
+      return res.status(400).json({ 
+        ok: false, 
+        error: "invalid_or_expired_scope", 
+        scope: scopeToValidate,
+        currentMinute,
+        message: "Proof scope must be valid for current minute"
+      });
     }
+
+    // Get current group root efficiently (O(1) operation)
+    const root = await getGroupRoot();
 
     if (proof.merkleTreeRoot !== root) {
       return res.status(400).json({ ok: false, error: "stale_or_invalid_root", currentRoot: root });
     }
+
+    
 
     const valid = await verifyProof(proof);
     if (!valid) {
@@ -43,21 +59,37 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     // Enforce one post per nullifier value (idempotent)
     const nullifier = proof.nullifier;
+    
+    // Check if this nullifier has already been used for any post
+    const { data: existingPost } = await supabase
+      .from("messages")
+      .select("id")
+      .eq("nullifier", nullifier)
+      .single();
+    
+    if (existingPost) {
+      console.log("🚫 Nullifier already used, rejecting post");
+      return res.status(400).json({ 
+        ok: false, 
+        error: "nullifier_already_used", 
+        message: "You can only post once per minute"
+      });
+    }
 
-    // Try to create a membership row for the nullifier to satisfy foreign key.
-    const { error: insertMembershipError } = await supabase.from("memberships").insert([
-      {
-        provider: "semaphore",
-        pubkey: nullifier,
-        pubkey_expiry: null,
-        proof: JSON.stringify(proof),
-        proof_args: JSON.stringify({ scope: proof.scope, root: proof.merkleTreeRoot }),
-        group_id: NS_DOMAIN,
-      },
-    ]);
+    // Record this root usage in group_roots table
+     const { error: rootInsertError } = await supabase
+       .from('group_roots')
+       .insert({
+         root: root.toString(),
+         depth: 20,
+         size: proof.merkleTreeDepth,
+         created_at: new Date().toISOString()
+       });
 
-    if (insertMembershipError && insertMembershipError.code !== "23505") {
-      throw new Error(`Failed to upsert nullifier membership: ${insertMembershipError.message}`);
+    if (rootInsertError) {
+      console.error("Failed to record group root:", rootInsertError);
+    } else {
+      console.log("Root recorded successfully");
     }
 
     const id = crypto.randomUUID().split("-").slice(0, 2).join("");
@@ -70,8 +102,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         group_provider: "ns-dkim",
         text,
         timestamp: now.toISOString(),
-        signature: nullifier, // placeholder to satisfy NOT NULL
-        pubkey: nullifier, // FK to memberships(pubkey)
+        proof: proof,
+        nullifier: nullifier,
         internal: false,
       },
     ]);
@@ -80,8 +112,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       throw new Error(`Failed to insert message: ${insertMessageError.message}`);
     }
 
-    return res.status(201).json({ ok: true, id });
-  } catch (e: any) {
+    return res.status(201).json({
+      ok: true,
+      id,
+      text,
+      timestamp: now.toISOString(),
+      group_id: NS_DOMAIN,
+      group_provider: "ns-dkim",
+      internal: false,
+      likes: 0
+    });
+  } catch (e: unknown) {
     // eslint-disable-next-line no-console
     console.error("/api/post error", e);
     return res.status(500).json({ ok: false, error: "internal_error" });

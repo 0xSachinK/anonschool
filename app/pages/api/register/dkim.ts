@@ -1,19 +1,12 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { createClient } from "@supabase/supabase-js";
-import { verifyDkimAndSubject, sha256Hex } from "../../../lib/dkim";
-
-export const config = {
-  api: {
-    bodyParser: {
-      sizeLimit: "2mb",
-    },
-  },
-};
+import { addMemberToGroup } from "../../../lib/semaphore-group";
+import SemaphoreGroupManager from "../../../lib/semaphore-group-manager";
+import { initZkEmailSdk, Proof } from "@zk-email/sdk";
 
 const supabaseUrl = process.env.SUPABASE_URL as string;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY as string;
 const NS_DOMAIN = (process.env.NS_DOMAIN || "ns.com").toLowerCase();
-const NS_ACCEPT_SUBJECT = process.env.NS_ACCEPT_SUBJECT || "Welcome to Network School!";
 
 if (!supabaseUrl || !supabaseKey) {
   throw new Error("Missing Supabase environment variables");
@@ -28,64 +21,82 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    const { eml, emlBase64, idCommitment } = req.body || {};
-
-    if (!eml && !emlBase64) {
-      return res.status(400).json({ ok: false, error: "Missing 'eml' or 'emlBase64' in body" });
+    const { proof, idCommitment } = req.body;
+    if (!proof || !idCommitment) {
+      return res.status(400).json({ ok: false, error: "Missing proof or idCommitment" });
     }
 
-    const raw = typeof emlBase64 === "string" ? Buffer.from(emlBase64, "base64").toString("utf8") : String(eml);
+    // Initialize the SDK with the official API
+    const sdk = initZkEmailSdk();
 
-    const verification = await verifyDkimAndSubject(raw, {
-      expectedDomain: NS_DOMAIN,
-      expectedSubject: NS_ACCEPT_SUBJECT,
-    });
+    // Get the blueprint
+    const blueprint = await sdk.getBlueprint("hackertron/NetworkSchool@v2");
 
-    if (!verification.ok) {
-      return res.status(400).json({ ok: false, error: verification.reason, details: verification.details });
+    // Parse the packed proof back into a Proof instance
+    const proofObj = await Proof.unPackProof(proof, "https://conductor.zk.email");
+
+
+    // Verify the proof
+    const verification = await blueprint.verifyProof(proofObj);
+    if (!verification) {
+      return res.status(400).json({ ok: false, error: "Invalid proof" });
     }
 
-    const { messageId, subject, dkim, summary } = verification;
 
-    const pubkey: string = typeof idCommitment === "string" && idCommitment.length > 0
-      ? idCommitment
-      : `dkim_${sha256Hex(`${messageId}|${NS_DOMAIN}`).slice(0, 32)}`;
 
-    const providerName = "dkim";
+    // Look up by header hash (single source of truth for dedup)
+    const proofHash = proofObj.getHeaderHash();
 
-    const proof = dkim ? JSON.stringify(dkim) : JSON.stringify({});
-    const proofArgs = JSON.stringify({
-      domain: NS_DOMAIN,
-      messageId,
-      subject,
-      idCommitment: idCommitment || null,
-      summary,
-    });
+    const { data: existingByProof } = await supabase
+      .from("memberships")
+      .select("pubkey")
+      .eq("provider", "ns-dkim")
+      .eq("group_id", NS_DOMAIN)
+      .eq("header_hash", proofHash)
+      .single();
 
-    const { error } = await supabase.from("memberships").insert([
-      {
-        provider: providerName,
-        pubkey,
-        pubkey_expiry: null,
-        proof,
-        proof_args: proofArgs,
-        group_id: NS_DOMAIN,
-      },
-    ]);
+    // If no record exists: create
+    if (!existingByProof) {
+      const proofArgs = {
+        proofHash,
+        idCommitment: idCommitment || null,
+      };
 
-    if (error) {
-      // If duplicate pubkey, treat as ok (idempotent)
-      if (error.code === "23505") {
-        return res.status(200).json({ ok: true, groupId: NS_DOMAIN, pubkey, existed: true });
+      const { error: insertError } = await supabase.from("memberships").insert([
+        {
+          provider: "ns-dkim",
+          pubkey: idCommitment,
+          pubkey_expiry: null,
+          proof: JSON.stringify(proof),
+          proof_args: proofArgs,
+          group_id: NS_DOMAIN,
+          header_hash: proofHash,
+        },
+      ]);
+      if (insertError) throw new Error(`Supabase insert failed: ${insertError.message}`);
+
+      if (idCommitment) {
+        await addMemberToGroup(idCommitment);
       }
-      throw new Error(`Supabase insert failed: ${error.message}`);
+
+      return res.status(200).json({ ok: true, groupId: NS_DOMAIN, pubkey: idCommitment });
     }
 
-    return res.status(200).json({ ok: true, groupId: NS_DOMAIN, pubkey, summary });
-  } catch (e: any) {
-    // eslint-disable-next-line no-console
-    console.error("/api/register/dkim error", e);
-    return res.status(500).json({ ok: false, error: "internal_error" });
+    // Record exists for this proof - return alreadyRegistered response
+    const existingPubkey: string = existingByProof.pubkey;
+    return res.status(200).json({
+      ok: true,
+      groupId: NS_DOMAIN,
+      pubkey: existingPubkey,
+      alreadyRegistered: true,
+      message: "This email is already registered. Each email can only be used once for registration."
+    });
+
+  } catch (e: unknown) {
+    const errorMessage = e instanceof Error ? e.message : "Unknown error";
+    const errorDetails = e instanceof Error ? e.stack : String(e);
+    console.error("/api/register/dkim error:", errorMessage);
+    console.error("Details:", errorDetails);
+    return res.status(500).json({ ok: false, error: errorMessage });
   }
 }
-

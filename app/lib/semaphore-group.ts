@@ -1,64 +1,67 @@
-import { createClient } from "@supabase/supabase-js";
-import { Group } from "@semaphore-protocol/group";
+import SemaphoreGroupManager, { NS_DOMAIN, SEMAPHORE_SCOPE, SEMAPHORE_DEFAULT_DEPTH } from "./semaphore-group-manager";
 
-const supabaseUrl = process.env.SUPABASE_URL as string;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY as string;
+const groupManager = SemaphoreGroupManager.getInstance();
 
-if (!supabaseUrl || !supabaseKey) {
-  throw new Error("Missing Supabase environment variables");
+
+/**
+ * Get current group root (O(1) operation)
+ * This is the most efficient way to get the group root
+ */
+export async function getGroupRoot(): Promise<string> {
+  await groupManager.initialize();
+  return groupManager.getRoot();
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+/**
+ * Add member to group (incremental operation)
+ * Call this when a new member registers
+ */
+export async function addMemberToGroup(commitment: string): Promise<void> {
+  await groupManager.initialize();
+  groupManager.addMemberToGroup(commitment);
+}
 
-export const NS_DOMAIN = (process.env.NS_DOMAIN || "ns.com").toLowerCase();
-export const SEMAPHORE_SCOPE = process.env.SEMAPHORE_SCOPE || "ns-forum-v1";
-export const SEMAPHORE_DEFAULT_DEPTH = parseInt(process.env.SEMAPHORE_TREE_DEPTH || "20", 10);
+/**
+ * Remove member from group (incremental operation)
+ * Call this when a member needs to be removed
+ */
+export async function removeMemberFromGroup(commitment: string): Promise<void> {
+  await groupManager.initialize();
+  groupManager.removeMemberByCommitment(commitment);
+}
 
-export async function fetchIdCommitments(): Promise<string[]> {
-  const { data, error } = await supabase
-    .from("memberships")
-    .select("proof_args")
-    .eq("provider", "dkim")
-    .eq("group_id", NS_DOMAIN);
+/**
+ * Generate Merkle proof for a member
+ */
+export async function generateMerkleProof(commitment: string) {
+  await groupManager.initialize();
+  return groupManager.generateMerkleProof(commitment);
+}
 
-  if (error) throw error;
-
-  const commitments: string[] = [];
-  for (const row of data || []) {
-    const args = row.proof_args as any;
-    const c = args?.idCommitment;
-    if (typeof c === "string" && c.length > 0 && c !== "0") {
-      commitments.push(c);
+/**
+ * @deprecated Use generateMerkleProof() instead
+ * Legacy function for backward compatibility
+ */
+export async function merkleProofForMember(idCommitment: string) {
+  await groupManager.initialize();
+  let merkle;
+  try {
+    merkle = groupManager.generateMerkleProof(idCommitment);
+  } catch (e) {
+    // If member not found, refresh from DB once to avoid stale in-memory state
+    if (e instanceof Error && e.message === 'Member not found in group') {
+      await groupManager.reinitialize();
+      merkle = groupManager.generateMerkleProof(idCommitment);
+    } else {
+      throw e;
     }
   }
-  return commitments;
-}
-
-export async function buildGroup() {
-  const members = await fetchIdCommitments();
-  // Deterministic ordering for stable root
-  members.sort();
-  const group = new Group(members as unknown as bigint[]);
-  return {
-    root: group.root.toString(),
-    depth: Math.max(group.depth, SEMAPHORE_DEFAULT_DEPTH),
-    size: group.size,
-    members,
-  };
-}
-
-export async function merkleProofForMember(idCommitment: string) {
-  const members = await fetchIdCommitments();
-  members.sort();
-  const group = new Group(members as unknown as bigint[]);
-  const index = group.indexOf(idCommitment);
-  if (index < 0) {
-    throw new Error("member_not_found");
-  }
-  const merkle = group.generateMerkleProof(index);
   return {
     root: merkle.root.toString(),
     index: merkle.index,
     siblings: merkle.siblings.map((s) => s.toString()),
   };
 }
+
+// Re-export constants for backward compatibility
+export { NS_DOMAIN, SEMAPHORE_SCOPE, SEMAPHORE_DEFAULT_DEPTH };
